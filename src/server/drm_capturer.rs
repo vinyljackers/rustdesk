@@ -24,6 +24,9 @@ const HANDSHAKE_WAIT_MS: u64 = DRM_CONNECT_TIMEOUT_MS + DISPLAY_LIST_TIMEOUT_MS 
 /// Only the header read rechecks `stop`, so bound the body read here rather than relying on
     /// `next_raw_into`'s own cap.
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// A repeat of the frame returned last goes out anyway once this much time has passed since
+/// then: a frame whose encode failed reaches the encoder again, even if nothing moves.
+const REPEAT_EVERY: Duration = Duration::from_secs(1);
 
 struct FrameSlot {
     // Row stride is `pixels.len() / height`, possibly padded; the format and the plane rotation
@@ -103,11 +106,26 @@ pub struct IpcDrmCapturer {
     cur_h: usize,
     cur_fmt: Pixfmt,
     got_frame: bool,
+    // A rotated output turns each frame into here first, to compare it with `cur`.
+    spare: Vec<u8>,
+    // When frame() last returned a frame; see REPEAT_EVERY.
+    returned_at: Instant,
 }
 
 /// A list index is NOT an identity: `drm_enumerate_all_displays` concatenates per-card lists.
 fn connector_key(d: &DrmDisplayInfo) -> String {
     format!("{}:{}", d.device, d.name)
+}
+
+/// The transform whose dimensions the delivered frames have: a plane rotated 90/270 in hardware
+/// already hands over the transposed scanout (and `frame_transform` then turns nothing), whatever
+/// the output transform says; otherwise the output transform is undone in software.
+fn delivered_transform(d: &DrmDisplayInfo, wl_transform: i32) -> i32 {
+    if d.plane_transposed {
+        90
+    } else {
+        wl_transform
+    }
 }
 
 /// Frame dimensions after undoing `transform` degrees of output rotation.
@@ -416,9 +434,13 @@ impl IpcDrmCapturer {
                 stop,
                 display,
                 connector: displays.get(wire_idx).map(connector_key),
-                session_size: displays
-                    .get(wire_idx)
-                    .map(|d| rotated_dims(wl_transform, d.width as usize, d.height as usize)),
+                session_size: displays.get(wire_idx).map(|d| {
+                    rotated_dims(
+                        delivered_transform(d, wl_transform),
+                        d.width as usize,
+                        d.height as usize,
+                    )
+                }),
                 transform: wl_transform,
                 snapshot_gen,
                 cur: Vec::new(),
@@ -426,6 +448,8 @@ impl IpcDrmCapturer {
                 cur_h: 0,
                 cur_fmt: Pixfmt::BGRA,
                 got_frame: false,
+                spare: Vec::new(),
+                returned_at: Instant::now(),
             },
             displays,
             wire_idx,
@@ -471,7 +495,7 @@ impl Drop for IpcDrmCapturer {
 impl TraitCapturer for IpcDrmCapturer {
     fn frame<'a>(&'a mut self, timeout: Duration) -> io::Result<Frame<'a>> {
         let deadline = Instant::now() + timeout;
-        {
+        let repeat = {
             let mut slot = self.shared.slot.lock().unwrap();
             loop {
                 if slot.latest.is_some() || slot.ended.is_some() {
@@ -526,9 +550,14 @@ impl TraitCapturer for IpcDrmCapturer {
                         ),
                     ));
                 }
-                if t == 0 {
+                // The producer grabs on a timer, so a still screen arrives as the same bytes every
+                // tick. `cur` still holds the previous frame; the same bytes in another format are
+                // another picture.
+                let repeat = if t == 0 {
+                    let repeat = fmt == self.cur_fmt && buf == self.cur;
                     let previous = std::mem::replace(&mut self.cur, buf);
                     self.shared.slot.lock().unwrap().recycle(previous);
+                    repeat
                 } else if !matches!(fmt, Pixfmt::BGRA | Pixfmt::RGBA) {
                     // Unreachable with today's producers (the convert path emits 4-byte pixels
                     // and the CPU path hardcodes BGRA); kept so a future non-4-byte producer
@@ -545,9 +574,12 @@ impl TraitCapturer for IpcDrmCapturer {
                         ),
                     ));
                 } else {
-                    unrotate_bgra(&buf, w, h, t, &mut self.cur);
+                    unrotate_bgra(&buf, w, h, t, &mut self.spare);
+                    let repeat = fmt == self.cur_fmt && self.spare == self.cur;
+                    std::mem::swap(&mut self.cur, &mut self.spare);
                     self.shared.slot.lock().unwrap().recycle(buf);
-                }
+                    repeat
+                };
                 self.cur_w = fw;
                 self.cur_h = fh;
                 self.cur_fmt = fmt;
@@ -564,6 +596,7 @@ impl TraitCapturer for IpcDrmCapturer {
                         }
                     }
                 }
+                repeat
             } else {
                 let err = slot
                     .ended
@@ -574,7 +607,11 @@ impl TraitCapturer for IpcDrmCapturer {
                 }
                 return Err(io::Error::new(io::ErrorKind::Other, err));
             }
+        };
+        if repeat && self.returned_at.elapsed() < REPEAT_EVERY {
+            return Err(io::ErrorKind::WouldBlock.into());
         }
+        self.returned_at = Instant::now();
         Ok(Frame::PixelBuffer(PixelBuffer::new(
             &self.cur,
             self.cur_fmt,
@@ -2122,7 +2159,8 @@ fn augment_with_wayland_geometry_from(
         // Identity matches ONLY, the same rule the capturer's transform follows: swapping on a
         // layout-order guess advertises dimensions the capturer will not deliver.
         let is_identity = identity[i].is_some() && identity[i] == matched[i];
-        if is_identity && (w.transform == 90 || w.transform == 270) {
+        // A plane-transposed display was already swapped by `display_info_from_drm`.
+        if is_identity && !drm[i].plane_transposed && (w.transform == 90 || w.transform == 270) {
             std::mem::swap(&mut info.width, &mut info.height);
             info.original_resolution = super::display_service::get_original_resolution(
                 &drm[i].name,
@@ -2259,13 +2297,18 @@ fn swap_available_displays(list: Vec<DrmDisplayInfo>) {
 }
 
 fn display_info_from_drm(d: &DrmDisplayInfo) -> DisplayInfo {
+    let (width, height) = rotated_dims(
+        delivered_transform(d, 0),
+        d.width as usize,
+        d.height as usize,
+    );
     let original_resolution =
-        super::display_service::get_original_resolution(&d.name, d.width as usize, d.height as usize);
+        super::display_service::get_original_resolution(&d.name, width, height);
     DisplayInfo {
         x: d.x,
         y: d.y,
-        width: d.width as i32,
-        height: d.height as i32,
+        width: width as i32,
+        height: height as i32,
         name: d.name.clone(),
         online: d.active,
         cursor_embedded: false,
@@ -2330,7 +2373,11 @@ pub(super) fn get_capturer_info(
     // Origin and transform come from the ONE snapshot new() resolved, so both reflect the
     // same output assignment; dimensions stay PHYSICAL, rotated to frame orientation.
     let origin = origin.unwrap_or((d.x, d.y));
-    let (cap_w, cap_h) = rotated_dims(capturer.transform, d.width as usize, d.height as usize);
+    let (cap_w, cap_h) = rotated_dims(
+        delivered_transform(&d, capturer.transform),
+        d.width as usize,
+        d.height as usize,
+    );
     Ok(super::video_service::CapturerInfo {
         origin,
         width: cap_w,
@@ -2376,6 +2423,8 @@ mod drm_capturer_tests {
             cur_h: 0,
             cur_fmt: Pixfmt::BGRA,
             got_frame: false,
+            spare: Vec::new(),
+            returned_at: Instant::now(),
         }
     }
 
@@ -2906,6 +2955,12 @@ mod drm_capturer_tests {
             Ok(_) => panic!("expected a pixel-buffer frame"),
             Err(err) => panic!("expected a delivered frame, got {err}"),
         }
+        // The same scanout again: once turned it repeats the frame above, so it is dropped.
+        put_frame_with(&c, w, h, Some(0x1), &src);
+        assert!(matches!(
+            c.frame(Duration::from_millis(50)),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock
+        ));
         // Hardware rotation (i915 + mutter): the scanout is already upright and is left alone.
         put_frame_with(&c, w, h, Some(0x4), &src);
         match c.frame(Duration::from_millis(50)) {
@@ -2916,14 +2971,65 @@ mod drm_capturer_tests {
             Err(err) => panic!("expected a delivered frame, got {err}"),
         }
         // A producer that cannot say (pre-0.5.8 library) keeps the old rule: 180 left alone.
-        put_frame_with(&c, w, h, None, &src);
+        // A new picture: `src` left alone is the frame above and would be dropped as a repeat.
+        let (other, _, _) = px_frame(&[&[7, 8, 9], &[10, 11, 12]], 0);
+        put_frame_with(&c, w, h, None, &other);
         match c.frame(Duration::from_millis(50)) {
             Ok(Frame::PixelBuffer(pb)) => {
-                assert_eq!(labels_of(pb.data(), w, h), vec![vec![1, 2, 3], vec![4, 5, 6]]);
+                assert_eq!(labels_of(pb.data(), w, h), vec![vec![7, 8, 9], vec![10, 11, 12]]);
             }
             Ok(_) => panic!("expected a pixel-buffer frame"),
             Err(err) => panic!("expected a delivered frame, got {err}"),
         }
+    }
+
+    #[test]
+    fn a_frame_equal_to_the_last_one_goes_out_once_a_second() {
+        let (still, w, h) = px_frame(&[&[1, 2, 3], &[4, 5, 6]], 0);
+        let (moved, _, _) = px_frame(&[&[1, 2, 3], &[4, 5, 7]], 0);
+        let mut c = capturer_with(Some((w, h)));
+        put_frame_with(&c, w, h, None, &still);
+        assert!(c.frame(Duration::from_millis(50)).is_ok());
+        put_frame_with(&c, w, h, None, &still);
+        assert!(matches!(
+            c.frame(Duration::from_millis(50)),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock
+        ));
+        // A second later it goes out again, in case its encode failed, and the second starts over.
+        std::thread::sleep(REPEAT_EVERY);
+        put_frame_with(&c, w, h, None, &still);
+        assert!(c.frame(Duration::from_millis(50)).is_ok());
+        put_frame_with(&c, w, h, None, &still);
+        assert!(matches!(
+            c.frame(Duration::from_millis(50)),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock
+        ));
+        put_frame_with(&c, w, h, None, &moved);
+        assert!(c.frame(Duration::from_millis(50)).is_ok());
+    }
+
+    #[test]
+    fn the_same_bytes_in_another_format_are_not_a_repeat() {
+        // Blue as BGRA, red as RGBA.
+        let px = [255u8, 0, 0, 255];
+        let put = |c: &IpcDrmCapturer, fmt| {
+            c.shared
+                .slot
+                .lock()
+                .unwrap()
+                .publish(1, 1, fmt, None, px.to_vec());
+            c.shared.cv.notify_one();
+        };
+        let mut c = capturer_with(Some((1, 1)));
+        put(&c, Pixfmt::BGRA);
+        assert!(c.frame(Duration::from_millis(50)).is_ok());
+        put(&c, Pixfmt::RGBA);
+        assert!(c.frame(Duration::from_millis(50)).is_ok());
+        put(&c, Pixfmt::RGBA);
+        assert!(matches!(
+            c.frame(Duration::from_millis(50)),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock
+        ));
     }
 
     #[test]
@@ -3037,9 +3143,12 @@ mod drm_capturer_tests {
     }
 
     fn put_frame_rot(c: &IpcDrmCapturer, w: usize, h: usize, plane_rotation: Option<u32>) {
+        // Each call differs in its first pixel: frame() drops a frame equal to the last one.
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let mut buf = c.shared.slot.lock().unwrap().take_free().unwrap_or_default();
         buf.clear();
         buf.resize(w * h * 4, 0);
+        buf[..4].copy_from_slice(&SEQ.fetch_add(1, Ordering::Relaxed).to_le_bytes());
         let mut slot = c.shared.slot.lock().unwrap();
         slot.publish(w, h, Pixfmt::BGRA, plane_rotation, buf);
         c.shared.cv.notify_one();
@@ -3792,6 +3901,7 @@ mod drm_capturer_tests {
             active: true,
             render_node: String::new(),
             device: String::new(),
+            plane_transposed: false,
         }
     }
 
@@ -3812,6 +3922,51 @@ mod drm_capturer_tests {
             refresh_rate: 60,
             transform: 0,
         }
+    }
+
+    fn plane_transposed_display(name: &str, w: u32, h: u32) -> DrmDisplayInfo {
+        DrmDisplayInfo {
+            plane_transposed: true,
+            ..drm_display(name, w, h)
+        }
+    }
+
+    #[test]
+    fn a_plane_transposed_display_advertises_its_scanout() {
+        // Steam Deck under gamescope: 800x1280 panel mode, 1280x800 framebuffer on a rotate-270
+        // plane, and no wayland output that matches the connector.
+        let drm = [plane_transposed_display("eDP-1", 800, 1280)];
+        let wl = scrap::wayland::display::Displays {
+            primary: 0,
+            displays: vec![],
+        };
+        let assignment = assign_wayland_outputs(&drm, &wl.displays);
+        let infos = augment_with_wayland_geometry_from(&drm, &wl, &assignment);
+        assert_eq!((infos[0].width, infos[0].height), (1280, 800));
+    }
+
+    #[test]
+    fn a_plane_transposed_scanout_is_delivered_at_the_advertised_size() {
+        let d = plane_transposed_display("eDP-1", 800, 1280);
+        let session = rotated_dims(delivered_transform(&d, 0), d.width as usize, d.height as usize);
+        let mut c = capturer_named(Some(session), Some("test:plane-transposed-session"));
+        put_frame_rot(&c, 1280, 800, Some(0x8));
+        assert!(matches!(c.frame(Duration::from_millis(50)), Ok(_)));
+    }
+
+    #[test]
+    fn a_rotated_output_over_a_rotated_plane_is_swapped_once() {
+        // mutter rotates the output and programs the plane from it: one quarter turn, as before.
+        let drm = [plane_transposed_display("HDMI-A-1", 1920, 1080)];
+        let mut out = wl_display("HDMI-1", 0, 0, 1920, 1080);
+        out.transform = 90;
+        let wl = scrap::wayland::display::Displays {
+            primary: 0,
+            displays: vec![out],
+        };
+        let assignment = assign_wayland_outputs(&drm, &wl.displays);
+        let infos = augment_with_wayland_geometry_from(&drm, &wl, &assignment);
+        assert_eq!((infos[0].width, infos[0].height), (1080, 1920));
     }
 
     #[test]
